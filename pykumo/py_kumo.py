@@ -258,6 +258,9 @@ class PyKumo(PyKumoBase):
 
         if speeds == 3:
             valid_speeds = ["quiet", "low", "powerful"]
+            
+            # My units report 3 speeds but supports "superQuiet"
+            valid_speeds.append('superQuiet')         
         else:
             valid_speeds = ["superQuiet", "quiet", "low", "powerful", "superPowerful"]
         try:

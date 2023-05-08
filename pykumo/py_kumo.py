@@ -36,10 +36,10 @@ class PyKumo(PyKumoBase):
     """
     # pylint: disable=R0904, R0902
 
-    def __init__(self, name, addr, cfg_json, timeouts=None, serial=None):
+    def __init__(self, name, addr, cfg_json, timeouts=None, serial=None, offset=0):
         """ Constructor
         """
-        super().__init__(name, addr, cfg_json, timeouts, serial)
+        super().__init__(name, addr, cfg_json, timeouts, serial, offset)
 
     def _retryable_response(self, response):
         """
@@ -223,7 +223,7 @@ class PyKumo(PyKumoBase):
     def get_heat_setpoint(self):
         """ Last retrieved heat setpoint from unit """
         try:
-            val = self._status['spHeat']
+            val = self._status['spHeat'] + self.get_setpoint_offset()
         except KeyError:
             val = None
         return val
@@ -231,7 +231,7 @@ class PyKumo(PyKumoBase):
     def get_cool_setpoint(self):
         """ Last retrieved cooling setpoint from unit """
         try:
-            val = self._status['spCool']
+            val = self._status['spCool'] - self.get_setpoint_offset()
         except KeyError:
             val = None
         return val
@@ -461,7 +461,7 @@ class PyKumo(PyKumoBase):
     def set_heat_setpoint(self, setpoint):
         """ Change setpoint for heat (in degrees C) """
         # TODO: honor min/max from profile
-        setpoint = round(float(setpoint), 1)
+        setpoint = round(float(setpoint) - self.get_setpoint_offset(), 1)
         command = ('{"c": { "indoorUnit": { "status": { "spHeat": %f } } } }' %
                    setpoint).encode('utf-8')
         response = self._request(command)
@@ -472,7 +472,7 @@ class PyKumo(PyKumoBase):
     def set_cool_setpoint(self, setpoint):
         """ Change setpoint for cooling (in degrees C) """
         # TODO: honor min/max from profile
-        setpoint = round(float(setpoint), 2)
+        setpoint = round(float(setpoint) + self.get_setpoint_offset(), 1)
         command = ('{"c": { "indoorUnit": { "status": { "spCool": %f } } } }' %
                    setpoint).encode('utf-8')
         response = self._request(command)

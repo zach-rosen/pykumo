@@ -67,6 +67,14 @@ class KumoCloudAccount:
                 unit[field] = raw_unit[field]
         except KeyError:
             pass
+        
+        fields = {'setpointOffset'}
+        for field in fields:
+            try:
+                unit[field] = raw_unit[field]
+            except KeyError:
+                unit[field] = None
+
         return unit
 
     def _fetch_if_needed(self):
@@ -234,6 +242,19 @@ class KumoCloudAccount:
 
         return None
 
+    def get_setpoint_offset(self, unit):
+        """ Return setpoint offset of named unit
+        """
+        self._fetch_if_needed()
+
+        try:
+            return self._units[unit]['setpointOffset']
+
+        except KeyError:
+            pass
+
+        return None
+
     def make_pykumos(self, timeouts=None, init_update_status=True):
         """ Return a dict mapping names of all indoor units to newly-created
         `PyKumoBase` objects
@@ -255,7 +276,8 @@ class KumoCloudAccount:
 
             kumo_class = KUMO_UNIT_TYPE_TO_CLASS.get(unitType, PyKumo)
             kumos[name] = kumo_class(name, self.get_address(unitSerial),
-                    self.get_credentials(unitSerial), timeouts, unitSerial)
+                    self.get_credentials(unitSerial), timeouts, unitSerial,
+                    self.get_setpoint_offset(unitSerial))
 
         if init_update_status:
             for pk in kumos.values():

@@ -4,26 +4,101 @@
 import hashlib
 import base64
 import time
+import datetime
 import logging
 import requests
+from collections.abc import MutableMapping
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 from requests.exceptions import Timeout
 from getpass import getpass
-from .const import CACHE_INTERVAL_SECONDS
+from .const import CACHE_INTERVAL_SECONDS, POSSIBLE_SENSORS
 from .py_kumo_base import PyKumoBase
 
 _LOGGER = logging.getLogger(__name__)
+ALL_FAN_SPEEDS=[
+    "superQuiet", "quiet", "low", "Low", "powerful", "superPowerful"]
+
+def merge(d, v):
+    """
+    Merge two dictionaries.
+
+    Merge dict-like `v` into dict-like `d`. In case keys between them are the same, merge
+    their sub-dictionaries where possible. Otherwise, values in `v` overwrite `d`.
+    """
+    for key in v:
+        if key in d and isinstance(d[key], MutableMapping) and isinstance(v[key], MutableMapping):
+            d[key] = merge(d[key], v[key])
+        else:
+            d[key] = v[key]
+    return d
 
 class PyKumo(PyKumoBase):
     """ Talk to and control one indoor unit.
     """
     # pylint: disable=R0904, R0902
 
-    def __init__(self, name, addr, cfg_json, timeouts=None, serial=None):
+    def __init__(self, name, addr, cfg_json, timeouts=None, serial=None, offset=0):
         """ Constructor
         """
-        super().__init__(name, addr, cfg_json, timeouts, serial)
+        super().__init__(name, addr, cfg_json, timeouts, serial, offset)
+
+    def _retryable_response(self, response):
+        """
+        Check whether response is retryable
+        """
+        return (response.get('_api_error', "") == 'serializer_error' or
+                response.get('_api_error', "") == 'device_authentication_error' or
+                '__no_memory' in str(response))
+
+    def _retrieve_attributes(
+            self, query_path: list[str], needed: list[str],
+            do_top_query: bool = False, retries=3) -> dict:
+        """ Try to retrieve a base query, but in specific error conditions retrieve specific
+            needed attributes individually.
+        """
+        base_query = '{"c":{'
+        for item in query_path:
+            base_query += '"' + item + '":{'
+        base_query += '}' * (len(query_path) + 2)
+        query = base_query.encode('utf-8')
+        try:
+            response = None
+            if do_top_query:
+                tries = 0
+                while tries < retries:
+                    response = self._request(query)
+                    if self._retryable_response(response):
+                        _LOGGER.info(f"Retry {tries} main query due to {response}")
+                        time.sleep(1.0)
+                        tries += 1
+                    else:
+                        break
+            if not response or self._retryable_response(response):
+                # Use individual attribute queries
+                response = {'r': {}}
+                for attribute in needed:
+                    attr_query = base_query.replace(
+                        '{}', '{"' + attribute + '":{}}').encode('utf-8')
+                    tries = 0
+                    while tries < retries:
+                        sub_response = self._request(attr_query)
+                        if self._retryable_response(response):
+                            _LOGGER.info(f"Retry {tries} sub query due to {response}")
+                            time.sleep(1.0)
+                            tries += 1
+                        else:
+                            break
+
+                    if attribute in str(sub_response):
+                        response = merge(response, sub_response)
+                    else:
+                        _LOGGER.warning(
+                            f"{self._name}: Did not get {attribute} from {attr_query}: {sub_response}")
+        except Exception as e:
+            _LOGGER.warning(
+                "Exception fetching %s: %s", base_query, str(e))
+        return response
 
     def update_status(self):
         """ Retrieve and cache current status dictionary if enough time
@@ -32,39 +107,62 @@ class PyKumo(PyKumoBase):
         now = time.monotonic()
         if (now - self._last_status_update > CACHE_INTERVAL_SECONDS or
                 'mode' not in self._status):
-            query = '{"c":{"indoorUnit":{"status":{}}}}'.encode('utf-8')
-            response = self._request(query)
+            query = ['indoorUnit', 'status']
+            needed = ['mode', 'standby', 'spHeat', 'spCool', 'roomTemp',
+                      'fanSpeed', 'vaneDir', 'filterDirty', 'defrost']
+            # Following not currently used:
+            # 'tempSource', 'activeThermistor', 'hotAdjust', 'runTest'
+            response = self._retrieve_attributes(query, needed)
             raw_status = response
             try:
                 self._status = raw_status['r']['indoorUnit']['status']
                 self._last_status_update = now
-            except KeyError:
-                _LOGGER.warning("Error retrieving status")
+            except KeyError as ke:
+                _LOGGER.warning(f"{self._name}: Error retrieving status from {response}: {str(ke)}")
                 return False
 
-            query = '{"c":{"sensors":{}}}'.encode('utf-8')
-            response = self._request(query)
-            sensors = response
-            try:
-                self._sensors = []
-                for sensor in sensors['r']['sensors'].values():
-                    if isinstance(sensor, dict) and sensor['uuid']:
+            self._sensors = []
+            for s in range(POSSIBLE_SENSORS):
+                s_str = f'{s}'
+                query = ['sensors', s_str]
+                needed = ['uuid', 'humidity', 'temperature', 'battery', 'rssi', 'txPower']
+                
+                response = self._retrieve_attributes(query, needed)
+
+                try:
+                    sensor = response['r']['sensors'][s_str]
+                    if isinstance(sensor, dict) and sensor.get('uuid'):
                         self._sensors.append(sensor)
-            except KeyError:
-                _LOGGER.warning("Error retrieving sensors")
-                return False
+                    else:
+                        # No sensor found at this index; skip the rest
+                        break
+                except KeyError as ke:
+                    _LOGGER.warning(f"{self._name}: Error retrieving sensors from {response}: {str(ke)}")
+                    return False
 
-            query = '{"c":{"indoorUnit":{"profile":{}}}}'.encode('utf-8')
-            response = self._request(query)
+            query = ['indoorUnit', 'profile']
+            needed = ['numberOfFanSpeeds', 'hasFanSpeedAuto', 'hasVaneSwing', 'hasModeDry',
+                      'hasModeHeat', 'hasModeVent', 'hasModeAuto', 'hasVaneDir']
+            # Following not currently used
+            # 'extendedTemps', 'usesSetPointInDryMode', 'hasHotAdjust', 'hasDefrost',
+            # 'hasStandby', 'maximumSetPoints', 'minimumSetPoints'
+            response = self._retrieve_attributes(query, needed)
             try:
                 self._profile = response['r']['indoorUnit']['profile']
-            except KeyError:
-                _LOGGER.warning("Error retrieving profile")
+            except KeyError as ke:
+                _LOGGER.warning(f"{self._name}: Error retrieving profile from {response}: {str(ke)}")
                 return False
 
             # Edit profile with settings from adapter
-            query = '{"c":{"adapter":{"status":{}}}}'.encode('utf-8')
-            response = self._request(query)
+            query = ['adapter', 'status']
+            needed = ['autoModePrevention', 'userHasModeDry', 'userHasModeHeat',
+                      'localNetwork', 'runState']
+            # Following not currently used:
+            # 'name', 'roomTempOffset', 'userMinCoolSetPoint', 'userMaxHeatSetPoint',
+            # 'ledDisabled', 'serverHostname'
+            # ['adapter', 'info'] not used:
+            # ['macAddress', 'serialNumber', 'isTestMode', 'firmwareVersion']
+            response = self._retrieve_attributes(query, needed)
             try:
                 status = response['r']['adapter']['status']
                 self._profile['hasModeAuto'] = not status.get(
@@ -79,8 +177,8 @@ class PyKumo(PyKumoBase):
                 except KeyError:
                     self._profile['wifiRSSI'] = None
                 self._profile['runState'] = status.get('runState', "unknown")
-            except KeyError:
-                _LOGGER.warning("Error retrieving adapter profile")
+            except KeyError as ke:
+                _LOGGER.warning(f"{self._name}: Error retrieving adapter profile from {response}: {str(ke)}")
                 return False
 
             # Edit profile with data from MHK2 if present
@@ -104,10 +202,9 @@ class PyKumo(PyKumoBase):
                         self._sensors.append(mhk2_sensor_value)
             except (KeyError, TypeError) as e:
                 # We don't bailout here since the MHK2 component is optional.
-                _LOGGER.info(f"Error retrieving MHK2 status: {e}")
+                _LOGGER.info(f"{self._name}: Error retrieving MHK2 status from {response}: {e}")
                 pass
         return True
-
 
     def get_mode(self):
         """ Last retrieved operating mode from unit """
@@ -128,7 +225,7 @@ class PyKumo(PyKumoBase):
     def get_heat_setpoint(self):
         """ Last retrieved heat setpoint from unit """
         try:
-            val = self._status['spHeat']
+            val = self._status['spHeat'] + self.get_setpoint_offset()
         except KeyError:
             val = None
         return val
@@ -136,7 +233,7 @@ class PyKumo(PyKumoBase):
     def get_cool_setpoint(self):
         """ Last retrieved cooling setpoint from unit """
         try:
-            val = self._status['spCool']
+            val = self._status['spCool'] - self.get_setpoint_offset()
         except KeyError:
             val = None
         return val
@@ -155,14 +252,16 @@ class PyKumo(PyKumoBase):
             speeds = self._profile['numberOfFanSpeeds']
         except KeyError:
             speeds = 5
-        if speeds not in (5, 3):
+        if speeds not in (5, 4, 3):
             _LOGGER.info(
                 "Unit reports a different number of fan speeds than "
-                "supported, %d != [5|3]. Please report which ones work!",
+                "supported, %d != [5|4|3]. Please report which ones work!",
                 self._profile['numberOfFanSpeeds'])
 
         if speeds == 3:
             valid_speeds = ["quiet", "low", "powerful"]
+        elif speeds == 4:
+            valid_speeds = ["quiet", "Low", "powerful", "superPowerful"]
         else:
             valid_speeds = ["superQuiet", "quiet", "low", "powerful", "superPowerful"]
         try:
@@ -262,6 +361,35 @@ class PyKumo(PyKumoBase):
             val = None
         return val
 
+    def get_hold_time(self):
+        """ Get hold time from MHK2 """
+        query = '{"c":{"mhk2":{"hold":{"adapter":{"endTime":{}}}}}}'.encode('utf-8')
+        response = self._request(query)
+        try:
+            end_time = response['r']['mhk2']['hold']['adapter']['endTime']
+        except KeyError:
+            end_time = None
+        return end_time
+
+    def get_hold_status(self):
+        """ Get hold status similar to representation on kumo app and MHK2 display """
+        end_time = self.get_hold_time()
+        # mhk returns 3774499593 for "permanent hold"
+        if end_time == None:
+            _LOGGER.warning("End time not available")
+            hold_status = ""
+        elif end_time == 3774499593:
+            hold_status = "permanent hold"
+        elif end_time == 0:
+            hold_status =  "following schedule"
+        elif (end_time - time.time()) > 82800:  # 23 hours
+            days = round((end_time - time.time()) / 86400)
+            hold_status =  f"hold for {days} days"
+        else:
+            dt = datetime.datetime.fromtimestamp(end_time)
+            hold_status =  f"hold until {dt.strftime('%H:%M')}"
+        return hold_status
+
     def has_dry_mode(self):
         """ True if unit has dry (dehumidify) mode """
         val = None
@@ -334,7 +462,7 @@ class PyKumo(PyKumoBase):
     def set_heat_setpoint(self, setpoint):
         """ Change setpoint for heat (in degrees C) """
         # TODO: honor min/max from profile
-        setpoint = round(float(setpoint), 1)
+        setpoint = round(float(setpoint) - self.get_setpoint_offset(), 1)
         command = ('{"c": { "indoorUnit": { "status": { "spHeat": %f } } } }' %
                    setpoint).encode('utf-8')
         response = self._request(command)
@@ -345,7 +473,7 @@ class PyKumo(PyKumoBase):
     def set_cool_setpoint(self, setpoint):
         """ Change setpoint for cooling (in degrees C) """
         # TODO: honor min/max from profile
-        setpoint = round(float(setpoint), 2)
+        setpoint = round(float(setpoint) + self.get_setpoint_offset(), 1)
         command = ('{"c": { "indoorUnit": { "status": { "spCool": %f } } } }' %
                    setpoint).encode('utf-8')
         response = self._request(command)
@@ -357,10 +485,15 @@ class PyKumo(PyKumoBase):
         """ Change fan speed. Valid speeds: superQuiet, quiet, low, powerful,
             superPowerful, sometimes auto
         """
+        if speed not in ALL_FAN_SPEEDS + ['auto']:
+            _LOGGER.warning(
+                "Attempting to set invalid fan speed %s", speed)
+            return {}
         valid_speeds = self.get_fan_speeds()
         if speed not in valid_speeds:
-            _LOGGER.warning("Attempting to set invalid fan speed %s", speed)
-            return {}
+            _LOGGER.warning(
+                "Unit does not report fan speed %s as supported. "
+                "Setting anyway", speed)
         command = ('{"c": { "indoorUnit": { "status": { "fanSpeed": "%s" } } } }'
                    % speed).encode('utf-8')
         response = self._request(command)
@@ -383,3 +516,13 @@ class PyKumo(PyKumoBase):
         self._last_status_update = time.monotonic()
         return response
 
+    def set_hold(self, end_time):
+        """ Set a hold on the current temperature until end_time.
+            Accepts unix timesamp.
+            MHK uses 4294967295 to set 'permanent hold'
+        """
+        command = ('{"c":{"mhk2":{"hold":{"adapter":{"endTime": %d}}}}}'
+                   % end_time).encode('utf-8')
+        response = self._request(command)
+        self._last_status_update = time.monotonic()
+        return response

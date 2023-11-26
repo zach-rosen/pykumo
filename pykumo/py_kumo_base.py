@@ -19,12 +19,14 @@ class PyKumoBase:
     """
     # pylint: disable=R0904, R0902
 
-    def __init__(self, name, addr, cfg_json, timeouts=None, serial=None):
+    def __init__(self, name, addr, cfg_json, timeouts=None, serial=None, offset=0):
         """ Constructor
         """
         self._name = name
         self._address = addr
         self._serial = serial
+        self._offset = offset
+        _LOGGER.info("Setpoint offset=%s", str(offset))
         self._security = {
             'password': base64.b64decode(cfg_json["password"]),
             'crypto_serial': bytearray.fromhex(cfg_json["crypto_serial"])}
@@ -64,6 +66,9 @@ class PyKumoBase:
     def _request(self, post_data):
         """ Send request to configured unit and return response dict
         """
+        if not self._address:
+            _LOGGER.warning("Unit %s address not set", self._name)
+            return {}
         url = "http://" + self._address + "/api"
         token = self._token(post_data)
         headers = {'Accept': 'application/json, text/plain, */*',
@@ -71,7 +76,7 @@ class PyKumoBase:
         token_param = {'m': token}
         try:
             with requests.Session() as session:
-                retries = Retry(total=3)
+                retries = Retry(total=3, backoff_factor=0.1)
                 session.mount('http://', HTTPAdapter(max_retries=retries))
                 _LOGGER.debug("Issue request %s %s", url, post_data)
                 response = session.put(
@@ -101,6 +106,12 @@ class PyKumoBase:
     def get_serial(self):
         """ Unit's serial number """
         return self._serial
+
+    def get_setpoint_offset(self):
+        """ Unit's setpoint offset """
+        if self._offset is not None:
+            return self._offset
+        return 0
 
     def get_sensor_rssi(self):
         """ Last retrievd sensor signal strength, if any """
